@@ -1,0 +1,15 @@
+# build output
+bin/
+obj/
+.vs/
+*.user
+
+# research data — keep only the scripts, not the regenerable bulk
+tools/*
+!tools/*.py
+
+# logs and local build noise
+*.log
+build_out.txt
+launch_out.txt
+__pycache__/

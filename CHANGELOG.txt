@@ -1,0 +1,35 @@
+Tanix External - update log (newest at the bottom)
+=====================================================
+
+2026-09-23 - Triggerbot rework: better accuracy, hitchance now works, min damage slider (101 shows as Kill), snipers only fire scoped, max distance slider.
+2026-09-23 - Menu scrolling: scroll wheel moves the list, smooth glide that stops when you stop.
+2026-09-23 - Menu is 1.5x bigger. New GUI Size dropdown in Misc (125% to 150%).
+2026-09-23 - Skeleton thickness button now opens a live preview card on the side.
+2026-09-23 - Aimbot tab icon is a crosshair now. Cheat renamed to Tanix External.
+2026-09-23 - Menu restyle: dark sidebar on the left, cyan accents, section titles.
+2026-09-23 - New Configs tab: save, load, name field, open-folder button. Files go in C:\TanixExternal. (Run as admin so it can write to C:.)
+2026-09-23 - Aimbot sub-panel: tick which hitboxes to use (head, neck, stomach, legs), it aims at the closest one. Prefer Head switch added.
+2026-09-23 - New C4 button in Misc: card with timer, planting, defusing, defuse time, plant site. Timer and site show in a small panel at the top, bomb gets a black C4 marker where it lies.
+2026-09-23 - C4 fixes: defuse countdown counts down for real now, bigger bomb marker and bigger status text.
+2026-09-23 - C4 planting hunt: added self-check that finds the right button signal while you play.
+2026-09-23 - C4 fix: dropped phantom bombs (dead slots reused by other entities now fail re-check).
+2026-09-23 - Color bars: setting everything to 0 no longer erases the feature and strands the picker (renders near-black instead).
+2026-09-23 - Wallhack row got an arrow opening Indicators: health bar, health text, bomb carrier tag, weapon name, held-nade dot. All saved in configs.
+2026-09-23 - Box card got a Top pad slider (stretches the top toward/away from the head, saved in configs). Opening any card or dropdown now closes the others.
+2026-09-23 - No admin needed anymore: configs moved to Documents\ZaValeriExternal (old C: folder still shows up read-only). Bhop memory mode still asks for rights only if the game blocks writing.
+2026-09-23 - Opening the cheat with no game running asks Steam to launch CS2 once.
+2026-09-23 - Box top sits on the head crown now, Top pad offsets from there.
+2026-09-23 - Launch prints the last three changelog lines in the console.
+2026-09-24 - Triggerbot is its own section now (bolt tab): enable, through wall, air check, auto scope, scope check, flash check, lock camera, shot delay, visible status, hit groups, min damage, hitchance %, reaction, max distance.
+2026-09-24 - Safe mode banner on top of Misc: blocks trigger/revolver/autowall from firing or turning on (says so on screen), tames aimbot to FOV 5 and smoothness 10, kills bhop.
+2026-09-24 - Fullscreen check: probes each second whether the overlay is really drawing; on exclusive fullscreen it says so in the console and log.
+2026-09-24 - Menu title draws with +1 px letter tracking so "rn" can't kern into an "m".
+2026-09-24 - ESP text (name, health, weapon, C4 tag) renders antialiased; overlay resolution is logged on every move so stretch is provable.
+2026-09-24 - Hit logs moved down the right edge, below the game's killfeed.
+2026-09-25 - Radar finds the map name itself again (old fixed slot read empty, art never loaded), checks its left/right against the live matrix every frame, map art rebuilt sharper for the bigger panel.
+2026-09-24 - Radar is bigger (240), sits top-left over the game's own radar, plots feet origins instead of head points, spectator list moved below it.
+2026-09-24 - Every feature starts OFF: box, skeleton, tracers, C4 switches, indicators, hit-log panel, scope/flash checks, prefer head.
+2026-09-24 - Launch prompt: if CS2 is closed the cheat asks before opening it (fades in/out); declining just waits for the game.
+2026-09-24 - Revolver trigger moved from AimHack into the Trigger section.
+2026-09-24 - Single instance: opening the cheat twice closes the older same-path copy instead of stacking overlays.
+2026-09-25 - Radar and spectator list moved a bit down so the CS2 settings header stays visible above them.
