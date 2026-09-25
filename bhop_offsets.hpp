@@ -1,8 +1,13 @@
 // Auto bhop offset sources: IDA-style signatures for client.dll code refs plus
 // a small fallback table for when a scan misses or its result fails live
-// validation. Fallback values refreshed 2026-09-24 from a2x/cs2-dumper main
-// output (offsets.json -> dw* globals, client_dll.json -> netvar fields);
-// the m_* entries were re-verified unchanged, only the dw* globals moved:
+// validation. The three dw* globals below are not numbers anymore: they come
+// straight from offsets.hpp (a2x/cs2-dumper, same refresh the ESP uses), so
+// every dumper refresh fixes the bhop too - the 2026-09-25 CS2 update moved
+// them and the stale copies here made the worker read null forever and report
+// "not in a match" while actually in one (dwLocalPlayerController is not
+// code-scanned, so its fallback was the only candidate it had). The m_*
+// netvars are name-scanned and were re-verified unchanged on 2026-09-25, so
+// they stay as numbers:
 //   https://github.com/a2x/cs2-dumper
 // Signatures are not verified across builds — the resolver always cross-checks
 // candidates against the live process and falls back to the values below, and
@@ -15,6 +20,8 @@
 
 #include <cstddef>
 #include <cstdint>
+
+#include "offsets.hpp"   // dw* fallbacks track the dumper refresh
 
 namespace bhop {
     // rip-relative load in client.dll code:
@@ -58,8 +65,8 @@ namespace bhop {
     // FL_ONGROUND — m_fFlags bit read for the air/ground edge
     inline constexpr uint32_t kOnGround = 1u << 0;
 
-    // fallback values; dw* globals come from offsets.json, fields from
-    // client_dll.json (refreshed 2026-09-24)
+    // fallback values; dw* globals track offsets.hpp (refreshed 2026-09-25),
+    // fields from client_dll.json (refreshed 2026-09-24, re-verified 09-25)
     struct Fallback {
         std::ptrdiff_t entityList;
         std::ptrdiff_t localPawn;
@@ -75,9 +82,9 @@ namespace bhop {
     };
 
     inline constexpr Fallback kFallback = {
-        0x2711048,   // client.dll::dwEntityList
-        0x255C5A8,   // client.dll::dwLocalPlayerPawn
-        0x25334D8,   // client.dll::dwLocalPlayerController
+        cs2_dumper::offsets::client_dll::dwEntityList,             // client.dll::dwEntityList
+        cs2_dumper::offsets::client_dll::dwLocalPlayerPawn,        // client.dll::dwLocalPlayerPawn
+        cs2_dumper::offsets::client_dll::dwLocalPlayerController,  // client.dll::dwLocalPlayerController
         0x3F4,       // C_BaseEntity::m_fFlags
         0x1330,      // C_BasePlayerPawn::m_pMovementServices
         0x50,        // CPlayer_MovementServices::m_nButtons

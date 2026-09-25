@@ -69,6 +69,7 @@ namespace cs2_dumper {
                 constexpr std::ptrdiff_t m_iIDEntIndex         = 0x36CC; // CEntityIndex under crosshair
                 constexpr std::ptrdiff_t m_bIsScoped           = 0x1EA0; // bool (local player)
                 constexpr std::ptrdiff_t m_iShotsFired         = 0x1EB4; // int32 (jump = a shot fired)
+                constexpr std::ptrdiff_t m_pAimPunchServices   = 0x1598; // CCSPlayer_AimPunchServices* (RCS)
                 constexpr std::ptrdiff_t m_angEyeAngles        = 0x35F0; // QAngle (pitch, yaw, roll)
             }
 

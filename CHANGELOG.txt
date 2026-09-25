@@ -27,9 +27,15 @@ Tanix External - update log (newest at the bottom)
 2026-09-24 - ESP text (name, health, weapon, C4 tag) renders antialiased; overlay resolution is logged on every move so stretch is provable.
 2026-09-24 - Hit logs moved down the right edge, below the game's killfeed.
 2026-09-25 - Radar finds the map name itself again (old fixed slot read empty, art never loaded), checks its left/right against the live matrix every frame, map art rebuilt sharper for the bigger panel.
+2026-09-25 - Hit logs read the held weapon every frame (manual-play headshots stopped logging as body); fatal hits use remaining-HP logic so one-taps above the stomach line log head.
+2026-09-25 - Aimbot FOV ring hides in menu/lobby, appears once the local pawn is on T/CT in a live match.
+2026-09-25 - FOV ring needs the live map name too: quit-to-menu keeps a stale sided pawn, but the engine clears the level name, so that combo can't fake a match anymore.
+2026-09-25 - C4 status panel moved to centre left, vertically centered, and enlarged (340x46 rows, 26 px bold text).
 2026-09-24 - Radar is bigger (240), sits top-left over the game's own radar, plots feet origins instead of head points, spectator list moved below it.
 2026-09-24 - Every feature starts OFF: box, skeleton, tracers, C4 switches, indicators, hit-log panel, scope/flash checks, prefer head.
 2026-09-24 - Launch prompt: if CS2 is closed the cheat asks before opening it (fades in/out); declining just waits for the game.
 2026-09-24 - Revolver trigger moved from AimHack into the Trigger section.
 2026-09-24 - Single instance: opening the cheat twice closes the older same-path copy instead of stacking overlays.
 2026-09-25 - Radar and spectator list moved a bit down so the CS2 settings header stays visible above them.
+2026-09-25 - Auto bhop dw* fallbacks now come from offsets.hpp: fixes "waiting: not in a match" while actually in one after the CS2 update.
+2026-09-25 - Autowall moved from the AimHack tab into the Trigger section (toggle and its Autowall Dmg gate).

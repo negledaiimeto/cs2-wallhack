@@ -260,9 +260,8 @@ static const int           kColRow[kColCount] = { 14, 15, 7, 9, 14, 39, 39, 39, 
 // at every launch, so the startup banner always announces what changed
 // (rewritten with every update before the build/restart)
 static const char* const kUpdateNote =
-    "radar and spectator list moved a bit down (top edge 80px lower) so the "
-    "CS2 settings header stays readable above them; new notes can be pushed "
-    "into this console live with log-update.ps1";
+    "autowall moved from the AimHack tab into the Trigger section - its toggle "
+    "and Autowall Dmg gate now sit with the revolver and trigger gates";
 static int                 g_rgbEdit = -1;      // open picker (kCol* index), -1 = closed
 static int                 s_rgbCol = 0;        // last open swatch: keeps the picker's layout valid while it fades out
 static bool                g_aimOn    = false;  // aimbot starts OFF; enabled from the in-game menu
@@ -299,6 +298,8 @@ static int   g_aimLockSlot = 0;      // aimbot lock mirror (HitLogTick reads it)
 static int   g_idEntSlot = -1;       // crosshair-trace slot this frame (-1 = none)
 static uintptr_t g_idEntPawn = 0;
 static uint16_t g_wepDef  = 0;              // local weapon definition index (damage table)
+static int      g_rcsSmooth = 5;            // RCS smoothness divisor 1..10 (safe mode pins 5)
+static bool     g_rcsOn     = false;        // recoil control starts OFF
 static bool  g_scoped     = false;          // local player is scoped (sniper gate)
 static bool                g_forceXh  = false;  // force sniper crosshair, off by default
 static bool                g_sniperHeld = false; // local weapon is a sniper rifle
@@ -323,6 +324,7 @@ static bool  g_safeMode    = false; // safe mode (header pill): blocks trigger/r
                                     // aim smoothness at 10, caps FOV at 5 deg and
                                     // floors aim reaction at 200 ms
 static bool                g_radarValid = false; // local origin captured this frame
+static bool                g_inMatch = false;   // local pawn on T/CT this frame: real match, not menu/lobby
 static Vec3                g_radarPos{};        // local player origin (radar centre)
 static Vec3                g_radarEye{};        // local eye — forward-sign reference
 static bool                g_knifeOut = false;  // local weapon is a knife: aimbot stays idle
@@ -1686,6 +1688,7 @@ static bool LoadRadarArt(const char* file, int slot) {
 // that EXACTLY names a calibrated map, and only that strict match is ever
 // accepted. Read-only probing; a miss just leaves dots-only plus a log.
 static std::ptrdiff_t g_mapNameOff = -1;   // discovered slot, cached per session
+static bool g_mapKnown = false;   // globalvars currently names a level (menu clears it)
 
 static bool MapNameRead(uintptr_t gv, char* out) {
     auto TrySlot = [&](std::ptrdiff_t off, char* dst) -> bool {
@@ -1729,15 +1732,20 @@ static bool MapNameRead(uintptr_t gv, char* out) {
 // ~5 Hz: read the map name and follow a change with the matching art. Called
 // from CollectPlayers (it runs every frame, even down early-return paths).
 static void RadarMapTick() {
-    if (!g_radarOn || !g_client) return;
+    if (!g_client) return;
     const DWORD now = GetTickCount();
     if (now - g_mapCheckMs < 200) return;
     g_mapCheckMs = now;
 
     const uintptr_t gv = Read<uintptr_t>(g_client + off::dwGlobalVars);
-    if (!gv) return;
+    if (!gv) { g_mapKnown = false; return; }
     char name[64]{};
-    if (!MapNameRead(gv, name)) return;
+    // the name read runs even with the radar off: the FOV ring's in-match
+    // test needs it too (a stale pawn can look sided in the menu, but the
+    // engine clears the level name on disconnect, so name + pawn = match)
+    if (!MapNameRead(gv, name)) { g_mapKnown = false; return; }
+    g_mapKnown = true;
+    if (!g_radarOn) return;
     const size_t len = strlen(name);
     if (g_radarMapSet && strcmp(name, g_radarMap) == 0) return;   // unchanged
 
@@ -2599,6 +2607,7 @@ static std::vector<EspPlayer> CollectPlayers() {
     s_plantName[0] = '\0';
     int trigSlot = -1;    // slot of the trigger target, matched during the walk
     g_radarValid = false; // re-captured below; stays false on every early return
+    g_inMatch = false;    // re-proven below; menu/lobby never reaches the team check
 
     float vm[16];
     if (!ReadBytes(g_client + off::dwViewMatrix, vm, sizeof(vm))) {
@@ -2611,6 +2620,14 @@ static std::vector<EspPlayer> CollectPlayers() {
     if (!localPawn) { Logf("[collect] early: no local pawn (menu?)\n"); return out; }
     const uint8_t localTeam = Read<uint8_t>(localPawn + net::C_BaseEntity::m_iTeamNum);
     if (localTeam < 2) { Logf("[collect] early: local team=%u\n", localTeam); return out; }
+    // the pawn alone is not proof: quit to menu and its memory still reads
+    // sided. The level name is the corroboration the engine maintains — it
+    // is cleared on disconnect, so sided pawn + named level = live match.
+    g_inMatch = g_mapKnown;
+    { static bool s_was = false;   // transition-only: proves the state in the log
+      if (g_inMatch != s_was) { s_was = g_inMatch;
+          Logf("[match] inMatch=%d team=%u mapKnown=%d\n",
+               g_inMatch ? 1 : 0, localTeam, g_mapKnown ? 1 : 0); } }
 
     // radar: the local origin centres the map; the local eye anchors the
     // forward-sign test in DrawRadar (three reads, radar only)
@@ -2705,31 +2722,33 @@ static std::vector<EspPlayer> CollectPlayers() {
     static DWORD s_snipMs    = 0;   // when the current sniper streak began
     static bool  s_revState = false; // stable revolver state (streak below)
     static DWORD s_revMs    = 0;   // when the current revolver streak began
-    if (g_aimOn || g_triggerOn || g_forceXh || g_revTg || g_awOn) {
-        bool knife  = false;
-        bool sniper = false;
-        bool revolver = false;
+    // active weapon handle -> weapon entity -> econ item view -> definition
+    // index. The def read runs every frame even in fully manual play: the
+    // hit-log head/body fallback reads g_wepDef, and gating it behind the
+    // features left it stale at 0, forcing every manual hit to "body".
+    // Only the knife/sniper/revolver streaks below stay feature-gated.
+    uint16_t def = 0;
+    {
         const uintptr_t weapSvc = Read<uintptr_t>(
             localPawn + net::C_BasePlayerPawn::m_pWeaponServices);
         if (weapSvc) {
             const uint32_t wh = Read<uint32_t>(
                 weapSvc + net::CPlayer_WeaponServices::m_hActiveWeapon);
             const uintptr_t weapon = wh ? EntityByIndex(entityList, wh & 0xFFFF) : 0;
-            uint16_t def = 0;
             if (weapon) {
                 const uintptr_t container =
                     weapon + net::C_EconEntity::m_AttributeManager;
                 def = Read<uint16_t>(
                     container + net::C_AttributeContainer::m_Item
                               + net::C_EconItemView::m_iItemDefinitionIndex);
-                knife  = (def == 42 || def == 59 || (def >= 500 && def < 600));
-                sniper = (def == 9 || def == 11 || def == 38 || def == 40);
-                revolver = (def == 64);           // R8 Revolver
             }
-            g_wepDef = def;   // 0 when unreadable: the damage gate passes it
-        } else {
-            g_wepDef = 0;
         }
+    }
+    g_wepDef = def;   // 0 when unreadable: the damage gate passes it
+    const bool knife    = (def == 42 || def == 59 || (def >= 500 && def < 600));
+    const bool sniper   = (def == 9 || def == 11 || def == 38 || def == 40);
+    const bool revolver = (def == 64);           // R8 Revolver
+    if (g_aimOn || g_triggerOn || g_forceXh || g_revTg || g_awOn || g_rcsOn) {
         // The flicker lives around switches, and it must be filtered
         // asymmetrically: a reticle that lingers over a rifle is what the
         // player notices, so dropping it commits after 30 ms (2 frames — a
@@ -2788,7 +2807,6 @@ static std::vector<EspPlayer> CollectPlayers() {
         g_revolverHeld = false;
         s_revState = false;
         s_revMs    = 0;
-        g_wepDef     = 0;
     }
 
     // resolve (and periodically re-resolve) the local controller's list index —
@@ -3801,21 +3819,22 @@ static const int kMenuRowW   = kMenuW - 2 * U(12); // row width = panel minus ma
 static const int kMenuRowH   = U(21);   // row height straight from the reference (23 px rows there)
 static const int kMenuPadX   = U(12);   // control column's left margin
 static const int kMenuPadB   = U(26);   // footer band: the hint under the row viewport
-static const int kMenuRows   = 59;      // + trigger section, + enemy weapons-on-Tab row
+static const int kMenuRows   = 62;      // + trigger section, + enemy weapons-on-Tab row, + RCS tab
 
 // feature sections: rows keep their global indices (every handler keys off
 // them) — a section lists which rows its tab shows, top to bottom; rows of
 // other tabs park off-screen via MenuRow
-enum { kSecWall = 0, kSecAim = 1, kSecGren = 2, kSecMisc = 3, kSecCfg = 4, kSecTrig = 5, kSecCount = 6 };
-static constexpr int kSecRows[kSecCount][15] = {
-    { 0, 14, 15, 42, 43, 8, 39, 58, -1, -1, -1, -1, -1, -1, -1 },    // Wallhack (eye):   master, box, skeleton, fill glow, outline glow, radar, tracers, weapons-on-Tab
-    { 1, 2, 3, 9, 10, 37, 38, 27, -1, -1, -1, -1, -1, -1, -1 },      // AimHack (bullet): aimbot block, autowall, sniper settings
-    { 31, 32, 33, 34, 35, 36, -1, -1, -1, -1, -1, -1, -1, -1, -1 },  // Grenades (pin):   esp, path, damage, flash, enemy-only, draw distance
-    { 11, 12, 13, 18, 7, 20, 28, 41, 40, -1, -1, -1, -1, -1, -1 },   // Misc (gear):      auto bhop, jump mode, status, spectators, xhair, gui size, c4, hit log, log time
-    { 21, 26, 22, 29, 23, 24, 25, -1, -1, -1, -1, -1, -1, -1, -1 },  // Configs (folder): picker, name, save, new, load, open folder, status
-    { 4, 30, 27, 50, 51, 53, 54, 55, 56, 57, 16, 6, 5, 17, -1 }      // Trigger (bolt):   enable, revolver, sniper settings, gates, lock, delay, visible, groups, min dmg, chance, reaction, max dist
+enum { kSecWall = 0, kSecAim = 1, kSecGren = 2, kSecMisc = 3, kSecCfg = 4, kSecTrig = 5, kSecRcs = 6, kSecCount = 7 };
+static constexpr int kSecRows[kSecCount][16] = {
+    { 0, 14, 15, 42, 43, 8, 39, 58, -1, -1, -1, -1, -1, -1, -1, -1 },    // Wallhack (eye):   master, box, skeleton, fill glow, outline glow, radar, tracers, weapons-on-Tab
+    { 1, 2, 3, 9, 10, 27, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },      // AimHack (bullet): aimbot block, sniper settings
+    { 31, 32, 33, 34, 35, 36, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },  // Grenades (pin):   esp, path, damage, flash, enemy-only, draw distance
+    { 11, 12, 13, 18, 7, 20, 28, 41, 40, -1, -1, -1, -1, -1, -1, -1 },   // Misc (gear):      auto bhop, jump mode, status, spectators, xhair, gui size, c4, hit log, log time
+    { 21, 26, 22, 29, 23, 24, 25, -1, -1, -1, -1, -1, -1, -1, -1, -1 },  // Configs (folder): picker, name, save, new, load, open folder, status
+    { 4, 30, 37, 38, 27, 50, 51, 53, 54, 55, 56, 57, 16, 6, 5, 17 },     // Trigger (bolt):   enable, revolver, autowall, autowall dmg, sniper settings, gates, lock, delay, visible, groups, min dmg, chance, reaction, max dist
+    { 59, 60, 61, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 }   // RCS (recoil):     master, smoothness bar, held weapon
 };
-static constexpr int kSecN[kSecCount] = { 8, 8, 6, 9, 7, 14 };
+static constexpr int kSecN[kSecCount] = { 8, 6, 6, 9, 7, 16, 3 };
 static int g_sec = kSecWall;            // active tab (UI thread only)
 static int g_menuScroll = 0;            // px the row list is scrolled up (mouse wheel)
 static int g_menuScrollT = 0;           // scroll target: the wheel sets it, each frame glides toward it
@@ -3823,12 +3842,12 @@ static int g_menuScrollT = 0;           // scroll target: the wheel sets it, eac
 // row membership by control type (row indices are global; kSecRows above
 // decides which tab shows them) — toggles and sliders are drawn and hit-tested
 // from these maps so each control keeps its own row
-static constexpr int kToggleRow[24] = { 0, 1, 4, 7, 8, 9, 11, 14, 15, 18, 30,
+static constexpr int kToggleRow[25] = { 0, 1, 4, 7, 8, 9, 11, 14, 15, 18, 30,
                                         31, 32, 33, 34, 35, 37, 41, 42, 43,
-                                        50, 51, 53, 58 };
-static constexpr int kToggleN      = 24;
-static constexpr int kSliderRow[17] = { 2, 3, 5, 6, 10, 16, 17, 19, 36, 38, 40,
-                                        44, 45, 46, 47, 54, 55 };
+                                        50, 51, 53, 58, 59 };
+static constexpr int kToggleN      = 25;
+static constexpr int kSliderRow[18] = { 2, 3, 5, 6, 10, 16, 17, 19, 36, 38, 40,
+                                        44, 45, 46, 47, 54, 55, 60 };
 static constexpr int   kSkelThickRow = 19;      // skeleton width bar (virtual row)
 static constexpr float kSkelThickMin = 1.0f, kSkelThickMax = 5.0f;  // 0.1 steps
 static constexpr int   kGlowFOpaRow = 44, kGlowFThkRow = 45;   // fill glow bars (virtual rows)
@@ -3872,6 +3891,10 @@ static constexpr int kTrigVisRow    = 56;  // visibility status label
 static constexpr int kTrigGroupRow  = 57;  // hit groups dropdown
 static constexpr int kTrigLockMin = 0, kTrigLockMax = 1000;
 static constexpr int kTrigGapMin = 50, kTrigGapMax = 500;
+static constexpr int kRcsRow       = 59;  // RCS master toggle (RCS tab)
+static constexpr int kRcsSmoothRow = 60;  // smoothness bar 1..10 (safe mode pins 5)
+static constexpr int kRcsWepRow    = 61;  // held-weapon label (RCS tab)
+static constexpr int kRcsSmoothMin = 1, kRcsSmoothMax = 10;
 
 // slot of a row inside the ACTIVE section, or -1 when it lives on another tab.
 // The skeleton width row is virtual: it is inserted right after the skeleton
@@ -4367,6 +4390,9 @@ static bool g_cfgDropOpen = false;
 static char g_cfgStatus[128] = "Idle";
 static char g_cfgName[64] = "config";   // typed into the Name row, used by Save
 static bool g_cfgNameFocus = false;     // Name row clicked: WM_CHAR types into it
+static bool  g_cfgDelArm = false;       // trash pressed: the status row asks first
+static DWORD g_cfgDelArmAt = 0;         // when it armed (confirmation times out)
+static char  g_cfgDelName[160] = "";    // target captured at arm time, shown in the question
 
 static void CfgNote(const char* msg) {
     strncpy_s(g_cfgStatus, sizeof(g_cfgStatus), msg, _TRUNCATE);
@@ -4506,6 +4532,7 @@ static void CfgSave() {
             g_trigAir ? 1 : 0,
             g_trigFlash ? 1 : 0, g_trigLockMs, g_trigGap, g_trigGroup,
             g_weapTabOn ? 1 : 0);
+    fprintf(f, "rcs=%d\nrcssm=%d\n", g_rcsOn ? 1 : 0, g_rcsSmooth);
     fprintf(f, "colBox=%d,%d,%d\ncolSkel=%d,%d,%d\ncolXh=%d,%d,%d\ncolFov=%d,%d,%d\n",
             g_colBox.r, g_colBox.g, g_colBox.b,
             g_colSkel.r, g_colSkel.g, g_colSkel.b,
@@ -4633,6 +4660,8 @@ static void CfgLoad() {
 else if (sscanf_s(line, "weaptab=%d", &a) == 1)    g_weapTabOn = a != 0;
         else if (sscanf_s(line, "hitlog=%d", &a) == 1)      g_hitLogLife = clampi(a, kHitLogMin, kHitLogMax);
         else if (sscanf_s(line, "hitgui=%d", &a) == 1)      g_hitLogGuiOn = a != 0;
+        else if (sscanf_s(line, "rcs=%d", &a) == 1)         g_rcsOn = a != 0;
+        else if (sscanf_s(line, "rcssm=%d", &a) == 1)       g_rcsSmooth = clampi(a, kRcsSmoothMin, kRcsSmoothMax);
         else if (sscanf_s(line, "trigair=%d", &a) == 1)     g_trigAir = a != 0;
         else if (sscanf_s(line, "trigflash=%d", &a) == 1)   g_trigFlash = a != 0;
         else if (sscanf_s(line, "triglock=%d", &a) == 1)    g_trigLockMs = clampi(a, kTrigLockMin, kTrigLockMax);
@@ -4707,6 +4736,37 @@ else if (sscanf_s(line, "weaptab=%d", &a) == 1)    g_weapTabOn = a != 0;
     ApplySafeLimits();   // a loaded config never smuggles past safe mode
 }
 
+// the confirmation bar's Yes: delete the file captured when the trash was
+// pressed. The name is searched again first, so a file that disappeared in
+// the meantime is reported instead of a stale path being unlinked; then the
+// list is rescanned and the selection slides to stay on the same file
+static void CfgDelete() {
+    g_cfgDelArm = false;
+    if (!g_cfgDelName[0]) return;
+    int idx = -1;
+    for (int i = 0; i < static_cast<int>(g_cfgFiles.size()) &&
+                    i < static_cast<int>(g_cfgPath.size()); ++i)
+        if (_stricmp(g_cfgFiles[i].c_str(), g_cfgDelName) == 0) { idx = i; break; }
+    if (idx < 0) {
+        CfgRefresh();
+        CfgNote("config is already gone");
+        return;
+    }
+    const std::string path = g_cfgPath[idx];
+    const std::string name = g_cfgFiles[idx];
+    if (g_cfgSel > idx) --g_cfgSel;   // keep the pick on the same file
+    if (DeleteFileA(path.c_str())) {
+        char msg[160];
+        sprintf_s(msg, "deleted %s", name.c_str());
+        CfgRefresh();                 // clamps g_cfgSel (to -1 when none left)
+        CfgNote(msg);
+    } else {
+        CfgNote(GetLastError() == ERROR_ACCESS_DENIED
+                    ? "delete denied (read-only or no write access)"
+                    : "delete failed");
+    }
+}
+
 // config picker dropdown: same mechanics as Jump Mode, file list instead
 static MenuBox CfgCombo() {
     const MenuBox r = MenuRow(kCfgRow);
@@ -4715,6 +4775,20 @@ static MenuBox CfgCombo() {
 static MenuBox CfgComboItem(int i) {
     const MenuBox c = CfgCombo();
     return { c.x, c.y + c.h + U(2) + i * (c.h - U(2)), c.w, c.h - U(2) };
+}
+// small trash button just left of the picker: deletes the picked config —
+// the first press only arms the question, which draws on the status row
+static MenuBox CfgDelBtn() {
+    const MenuBox c = CfgCombo();
+    return { c.x - U(3) - U(24), c.y, U(24), c.h };
+}
+static MenuBox CfgDelYes() {
+    const MenuBox r = MenuRow(kCfgStatusRow);
+    return { r.x + r.w - U(6) - U(104), r.y + U(2), U(50), r.h - U(4) };
+}
+static MenuBox CfgDelNo() {
+    const MenuBox r = MenuRow(kCfgStatusRow);
+    return { r.x + r.w - U(6) - U(50), r.y + U(2), U(50), r.h - U(4) };
 }
 
 // config action button: full-row rounded button, accent edge on hover
@@ -4746,6 +4820,27 @@ static void DrawCfgBtn(HDC dc, int row, const char* label) {
     DeleteObject(bp);
     RECT lr{ b.x, b.y, b.x + b.w, b.y + b.h };
     SetTextColor(dc, hot ? RGB(255, 255, 255) : RGB(200, 205, 215));
+    DrawTextA(dc, label, -1, &lr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+// small Yes/No button on the delete-confirmation bar; the Yes edge turns red
+// on hover because it is the destructive half
+static void DrawCfgMini(HDC dc, const MenuBox& b, const char* label, bool danger) {
+    const bool hot = InBox(b, g_uiPos.x, g_uiPos.y);
+    HBRUSH bb = CreateSolidBrush(hot ? RGB(31, 31, 38) : RGB(24, 24, 28));
+    HPEN   bp = CreatePen(PS_SOLID, 1,
+                          hot ? (danger ? RGB(206, 86, 86) : Cref(g_colAccent))
+                              : RGB(72, 72, 80));
+    HGDIOBJ oBB = SelectObject(dc, bb);
+    HGDIOBJ oBP = SelectObject(dc, bp);
+    AaRoundRectSel(dc, b.x, b.y, b.x + b.w, b.y + b.h, U(6), U(6));
+    SelectObject(dc, oBB);
+    SelectObject(dc, oBP);
+    DeleteObject(bb);
+    DeleteObject(bp);
+    RECT lr{ b.x, b.y, b.x + b.w, b.y + b.h };
+    SetTextColor(dc, hot && danger ? RGB(240, 150, 150)
+                   : hot ? RGB(255, 255, 255) : RGB(200, 205, 215));
     DrawTextA(dc, label, -1, &lr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
@@ -4873,6 +4968,21 @@ static void IconBolt(HDC dc, int cx, int cy, COLORREF fg) {
                    { cx - U(1), cy + U(1) }, { cx - U(2), cy + U(8) },
                    { cx + U(4), cy - U(1) }, { cx + U(1), cy - U(1) } };
     Polygon(dc, p, 6);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+}
+
+// recoil glyph for the RCS tab: a reticle ring with a downward arrow through
+// it — the compensation pulls the kicked view back down onto the target
+static void IconRcs(HDC dc, int cx, int cy, COLORREF fg) {
+    HPEN pen = CreatePen(PS_SOLID, 1, fg);
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    AaEllipseSel(dc, cx - U(7), cy - U(7), cx + U(7), cy + U(7));     // reticle ring
+    MoveToEx(dc, cx, cy - U(9), nullptr); LineTo(dc, cx, cy + U(5));  // arrow shaft
+    MoveToEx(dc, cx - U(4), cy + U(1), nullptr); LineTo(dc, cx, cy + U(5));
+    MoveToEx(dc, cx + U(4), cy + U(1), nullptr); LineTo(dc, cx, cy + U(5));
     SelectObject(dc, ob);
     SelectObject(dc, op);
     DeleteObject(pen);
@@ -5854,11 +5964,13 @@ static void DrawBomb(HDC dc) {
     }
     if (n == 0) return;
 
-    HFONT f = MakeFont(18, FW_BOLD);
+    // panel on the centre left: this column owns the left edge below the
+    // radar, so it sits midway down the screen instead of top-center
+    HFONT f = MakeFont(26, FW_BOLD);
     HGDIOBJ oF = SelectObject(dc, f);
-    const int w = U(230), rh = U(30);
-    const int h = rh * n + U(16);
-    const int x = (g_width - w) / 2, y = U(56);
+    const int w = U(340), rh = U(46);
+    const int h = rh * n + U(20);
+    const int x = U(14), y = (g_height - h) / 2;
     HBRUSH bg = CreateSolidBrush(RGB(8, 8, 8));
     HPEN   bd = CreatePen(PS_SOLID, 1, RGB(60, 66, 80));
     HGDIOBJ oBg = SelectObject(dc, bg);
@@ -5869,7 +5981,7 @@ static void DrawBomb(HDC dc) {
     DeleteObject(bg);
     DeleteObject(bd);
     for (int i = 0; i < n; ++i) {
-        RECT r{ x, y + U(6) + i * rh, x + w, y + U(6) + i * rh + rh };
+        RECT r{ x + U(10), y + U(10) + i * rh, x + w - U(10), y + U(10) + i * rh + rh };
         SetTextColor(dc, rows[i].col);
         DrawTextA(dc, rows[i].text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
@@ -6429,7 +6541,7 @@ static void DrawMenu(HDC dc) {
     // edge strip, white label and accent icon, inactive tabs sit dim and
     // light up on hover (the reference menu's left rail)
     {
-        static const char* secName[kSecCount] = { "Wallhack", "AimHack", "Grenades", "Misc", "Configs", "Trigger" };
+        static const char* secName[kSecCount] = { "Wallhack", "AimHack", "Grenades", "Misc", "Configs", "Trigger", "RCS" };
         // the active section's box eases over to the tab that was clicked: a
         // critically damped spring (from rest, no overshoot), so the highlight
         // accelerates out of its place and decelerates into the new one
@@ -6469,6 +6581,7 @@ static void DrawMenu(HDC dc) {
             else if (s == kSecMisc) IconGear(dc, icx, icy, ic, bg);
             else if (s == kSecGren) IconGrenade(dc, icx, icy, ic);
             else if (s == kSecCfg) IconFolder(dc, icx, icy, ic);
+            else if (s == kSecRcs) IconRcs(dc, icx, icy, ic);
             else                   IconBolt(dc, icx, icy, ic);
             RECT nr{ tb.x + U(26), tb.y, tb.x + tb.w - U(6), tb.y + tb.h };
             SetTextColor(dc, fg);
@@ -6479,7 +6592,7 @@ static void DrawMenu(HDC dc) {
     // content header: the section name centred over the rows in muted grey
     // (reference menu floats its group titles with no rule underneath)
     {
-        static const char* secHead[kSecCount] = { "Wallhack", "AimHack", "Grenades", "Misc", "Configs", "Trigger" };
+        static const char* secHead[kSecCount] = { "Wallhack", "AimHack", "Grenades", "Misc", "Configs", "Trigger", "RCS" };
         const int hx = panel.x + kSideW + kMenuPadX;
         HFONT hd = MakeFont(13, FW_SEMIBOLD);
         HGDIOBJ oHd = SelectObject(dc, hd);
@@ -6562,7 +6675,8 @@ static void DrawMenu(HDC dc) {
                                      "Hit Log", "Fill Glow", "Outline Glow",
                                      "Air Check", "Auto Scope",
                                      "Flash Check",
-                                     "Enemy Weapons (Tab)" };
+                                     "Enemy Weapons (Tab)",
+                                     "Recoil Control" };
     const bool  states[kToggleN] = { g_espOn, g_aimOn, g_triggerOn, g_forceXh,
                                      g_radarOn, g_fovCircleOn, g_bhopOn.load(),
                                      g_boxOn, g_skelOn, g_specOn, g_revTg,
@@ -6570,7 +6684,8 @@ static void DrawMenu(HDC dc) {
                                      g_grFlashOn, g_grEnemyOn, g_awOn,
                                      g_hitLogGuiOn, g_glowFillOn, g_glowOutOn,
                                      g_trigAir, g_autoScope,
-                                     g_trigFlash, g_weapTabOn };
+                                     g_trigFlash, g_weapTabOn,
+                                     g_rcsOn };
 
     for (int i = 0; i < kToggleN; ++i) {
         if (!RowShown(kToggleRow[i])) continue;   // another section's toggle
@@ -6802,6 +6917,7 @@ static void DrawMenu(HDC dc) {
         // "opacity" is a lerp toward the panel background color
         const bool  on = rowIdx == kHitLogRow ? (g_aimOn || g_triggerOn)
                        : rowIdx == kSkelThickRow ? g_skelOn
+                       : rowIdx == kRcsSmoothRow ? g_rcsOn
                        : rowIdx == kGrenDistRow
                            ? (g_grEspOn || g_grPathOn || g_grDmgOn || g_grFlashOn)
                        : (rowIdx == kGlowFOpaRow || rowIdx == kGlowFThkRow)
@@ -6911,6 +7027,26 @@ static void DrawMenu(HDC dc) {
     DrawSlider(55, "Shot Delay",
                static_cast<float>(g_trigGap - kTrigGapMin) /
                    static_cast<float>(kTrigGapMax - kTrigGapMin), gapTxt);
+    // RCS: smoothness 1..10 (safe mode pins it at 5) and the weapon in hand —
+    // the reader keys off this def index, so the row shows what RCS is tuning
+    char rcsTxt[16];
+    sprintf_s(rcsTxt, "%d", g_rcsSmooth);
+    DrawSlider(kRcsSmoothRow, "Smoothness",
+               static_cast<float>(g_rcsSmooth - kRcsSmoothMin) /
+                   static_cast<float>(kRcsSmoothMax - kRcsSmoothMin), rcsTxt);
+    if (RowShown(kRcsWepRow)) {
+        const MenuBox row = MenuRow(kRcsWepRow);
+        RECT lr{ row.x + U(4), row.y, row.x + U(146), row.y + row.h };
+        SetTextColor(dc, RGB(235, 235, 235));
+        DrawTextA(dc, "Held Weapon", -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        const char* wn = WeapName(g_wepDef);
+        if (!wn) wn = IsNadeDef(g_wepDef) ? InvNadeName(g_wepDef)
+                                          : (g_wepDef ? "Item" : "--");
+        RECT vr{ row.x + U(150), row.y, row.x + row.w - U(12), row.y + row.h };
+        SetTextColor(dc, g_wepDef ? RGB(214, 214, 220) : RGB(150, 154, 164));
+        DrawTextA(dc, wn, -1, &vr,
+                  DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
     // visible now: open sight, walled pick, or nothing under the crosshair
     if (RowShown(56)) {
         const MenuBox row = MenuRow(56);
@@ -7130,6 +7266,39 @@ static void DrawMenu(HDC dc) {
         LineTo(dc, cx + U(5), cy + (dropOpen ? -U(2) : -U(3)));
         SelectObject(dc, oCh);
         DeleteObject(chPn);
+
+        // small trash button left of the picker: bin glyph, red edge on
+        // hover, dimmed while nothing is picked to delete
+        const MenuBox tb = CfgDelBtn();
+        const bool delHot = InBox(tb, g_uiPos.x, g_uiPos.y);
+        const bool delLive = g_cfgSel >= 0 &&
+                             g_cfgSel < static_cast<int>(g_cfgFiles.size());
+        HBRUSH tbBg = CreateSolidBrush(delHot && delLive ? RGB(38, 24, 26) : RGB(24, 24, 28));
+        HPEN   tbPn = CreatePen(PS_SOLID, 1,
+                                !delLive ? RGB(52, 52, 58)
+                                         : delHot ? RGB(206, 86, 86) : RGB(72, 72, 80));
+        HGDIOBJ oTBB = SelectObject(dc, tbBg);
+        HGDIOBJ oTBP = SelectObject(dc, tbPn);
+        AaRoundRectSel(dc, tb.x, tb.y, tb.x + tb.w, tb.y + tb.h, U(5), U(5));
+        SelectObject(dc, oTBB);
+        SelectObject(dc, oTBP);
+        DeleteObject(tbBg);
+        DeleteObject(tbPn);
+        HPEN gp = CreatePen(PS_SOLID, 2,
+                            !delLive ? RGB(84, 84, 90)
+                                     : delHot ? RGB(232, 120, 120) : RGB(168, 172, 182));
+        HGDIOBJ oGP = SelectObject(dc, gp);
+        const int tx = tb.x + tb.w / 2, ty = tb.y + tb.h / 2;
+        MoveToEx(dc, tx - U(7), ty - U(4), nullptr);      // lid
+        LineTo(dc, tx + U(7), ty - U(4));
+        MoveToEx(dc, tx - U(5), ty - U(1), nullptr);      // tapered body
+        LineTo(dc, tx - U(4), ty + U(7));
+        LineTo(dc, tx + U(4), ty + U(7));
+        LineTo(dc, tx + U(5), ty - U(1));
+        MoveToEx(dc, tx, ty - U(1), nullptr);             // rib
+        LineTo(dc, tx, ty + U(4));
+        SelectObject(dc, oGP);
+        DeleteObject(gp);
     }
 
     // config name field: click to focus, then type (WM_CHAR); Enter, Esc or
@@ -7232,16 +7401,29 @@ static void DrawMenu(HDC dc) {
     DrawCfgBtn(dc, kCfgLoadRow, "Load Config");
     DrawCfgBtn(dc, kCfgOpenRow, "Open Folder");
 
-    // config status: last save/load result
+    // config status: last save/load result — while the trash waits for its
+    // Yes the same row asks the question instead
     if (RowShown(kCfgStatusRow)) {
         const MenuBox row = MenuRow(kCfgStatusRow);
-        RECT lr{ row.x + U(4), row.y, row.x + U(146), row.y + row.h };
-        SetTextColor(dc, RGB(235, 235, 235));
-        DrawTextA(dc, "Status", -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        if (g_cfgDelArm) {
+            char q[224];
+            sprintf_s(q, "Are you sure you want to delete (%s)?", g_cfgDelName);
+            RECT qr{ row.x + U(6), row.y, CfgDelYes().x - U(8), row.y + row.h };
+            SetTextColor(dc, RGB(235, 235, 235));
+            DrawTextA(dc, q, -1, &qr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            DrawCfgMini(dc, CfgDelNo(), "No", false);
+            DrawCfgMini(dc, CfgDelYes(), "Yes", true);
+        } else {
+            RECT lr{ row.x + U(4), row.y, row.x + U(146), row.y + row.h };
+            SetTextColor(dc, RGB(235, 235, 235));
+            DrawTextA(dc, "Status", -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        RECT sr{ row.x + U(140), row.y, row.x + row.w - U(8), row.y + row.h };
-        SetTextColor(dc, RGB(190, 195, 205));
-        DrawTextA(dc, g_cfgStatus, -1, &sr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            RECT sr{ row.x + U(140), row.y, row.x + row.w - U(8), row.y + row.h };
+            SetTextColor(dc, RGB(190, 195, 205));
+            DrawTextA(dc, g_cfgStatus, -1, &sr,
+                      DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
     }
 
     // open dropdown list drawn last so it can cover the status row
@@ -7385,7 +7567,7 @@ static void DrawMenu(HDC dc) {
     DrawTextA(dc, "INSERT closes the menu", -1, &ftr, DT_LEFT | DT_SINGLELINE);
     // the autowall rows describe themselves while hovered — the feature's
     // whole contract in one line, right where the cursor already is
-    const bool awHover = g_sec == kSecAim &&
+    const bool awHover = RowShown(kAwRow) &&
         (RowHit(MenuRow(kAwRow), g_uiPos.x, g_uiPos.y) ||
          RowHit(MenuRow(kAwDmgRow), g_uiPos.x, g_uiPos.y));
     // the tracer row (its arrow button included) says what its tracers track
@@ -7416,6 +7598,12 @@ static void DrawMenu(HDC dc) {
         // honesty line: everything on this tab is a model, not game data
         SetTextColor(dc, RGB(143, 143, 150));
         DrawTextA(dc, "estimates only - HE 99x(1-d/350), flash by angle+range",
+                  -1, &ftr, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    else if (g_sec == kSecRcs) {
+        // the tab explains itself: live per-weapon kick, bar = lag not loss
+        SetTextColor(dc, RGB(143, 143, 150));
+        DrawTextA(dc, "pulls the kick back down while spraying - 1 = instant, 10 = slowest",
                   -1, &ftr, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     SelectObject(dc, oldFont);
@@ -7511,6 +7699,11 @@ static void ApplySafeLimits() {
             Logf("[safe] %s smoothness 10\n", kWepName[cl]);
         }
     }
+    if (g_rcsSmooth != 5) {     // safe mode pins the RCS smoothness bar at 5
+        g_rcsSmooth = 5;
+        printf("[*] safe mode: rcs smoothness -> 5\n");
+        Logf("[safe] rcs smoothness 5\n");
+    }
 }
 
 static void CloseCards() {
@@ -7569,6 +7762,13 @@ static void HandleMenuInput() {
     const bool lmb      = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     const bool pollEdge = lmb && !prevPollLmb;
 
+    // the confirmation never stays armed forever: a click resolves it faster,
+    // this catches just walking away from the menu
+    if (g_cfgDelArm && GetTickCount() - g_cfgDelArmAt > 10000) {
+        g_cfgDelArm = false;
+        Logf("[cfg] delete confirmation timed out\n");
+    }
+
     if (menuKey && !prevMenuKey) {
         g_menuOpen = !g_menuOpen;
         if (g_menuOpen) {
@@ -7586,6 +7786,7 @@ static void HandleMenuInput() {
             SetFocusTarget(g_cs2Wnd);            // give input back to the game
             s_dragPanel = false;                 // no half-finished drag on reopen
             g_cfgNameFocus = false;              // typing never survives a close
+            g_cfgDelArm = false;                 // nor an armed delete question
             g_bhopDropOpen = false;              // don't reopen with a stale list
             g_wepDropOpen = false;               // nor a stale weapon-class list
             g_rgbEdit = -1;                      // nor a stale colour picker
@@ -7738,6 +7939,7 @@ static void HandleMenuInput() {
             const bool hitGrFl   = RowHit(MenuRow(kToggleRow[14]), g_uiPos.x, g_uiPos.y);
             const bool hitGrEn   = RowHit(MenuRow(kToggleRow[15]), g_uiPos.x, g_uiPos.y);
             const bool hitInvTab = RowHit(MenuRow(kToggleRow[23]), g_uiPos.x, g_uiPos.y);
+            const bool hitRcs = RowHit(MenuRow(kToggleRow[24]), g_uiPos.x, g_uiPos.y);
             const bool hitSafe = InBox(SmHeaderBtn(), g_uiPos.x, g_uiPos.y);
             // sniper settings: its Trigger row button, plus the card's two
             // switch bands while the card is up
@@ -7790,6 +7992,11 @@ static void HandleMenuInput() {
             const bool hitCfgLoad = RowHit(MenuRow(kCfgLoadRow), g_uiPos.x, g_uiPos.y);
             const bool hitCfgOpen = RowHit(MenuRow(kCfgOpenRow), g_uiPos.x, g_uiPos.y);
             const bool hitCfgName = RowHit(MenuRow(kCfgNameRow), g_uiPos.x, g_uiPos.y);
+            const bool hitCfgDel = RowHit(CfgDelBtn(), g_uiPos.x, g_uiPos.y);
+            const bool hitCfgDelYes = g_cfgDelArm &&
+                                      RowHit(CfgDelYes(), g_uiPos.x, g_uiPos.y);
+            const bool hitCfgDelNo = g_cfgDelArm &&
+                                     RowHit(CfgDelNo(), g_uiPos.x, g_uiPos.y);
             const bool hitAimCfgBtn = RowShown(1) && RowHit(AimCfgBtn(), g_uiPos.x, g_uiPos.y);
             const bool hitTrigAir  = RowHit(MenuRow(kToggleRow[20]), g_uiPos.x, g_uiPos.y);
             const bool hitTrigScopeM = RowHit(MenuRow(kToggleRow[21]), g_uiPos.x, g_uiPos.y);
@@ -7869,6 +8076,16 @@ static void HandleMenuInput() {
                 Logf("[ui] box card closed (click outside)\n");
             }
 
+            // the delete confirmation cancels on a click anywhere but its own
+            // bar (the trash button is excluded: a second press re-arms it)
+            const bool inCfgDelBar = g_cfgDelArm &&
+                                     RowHit(MenuRow(kCfgStatusRow),
+                                            g_uiPos.x, g_uiPos.y);
+            if (g_cfgDelArm && !inCfgDelBar && !hitCfgDel) {
+                g_cfgDelArm = false;
+                Logf("[cfg] delete confirmation cancelled\n");
+            }
+
             // the sniper settings card closes the same way: a click anywhere
             // but on it takes it down — the row button toggles it below, so
             // one press still flips the card
@@ -7924,8 +8141,9 @@ static void HandleMenuInput() {
                 // a tab press switches sections (and takes down any open list)
                 CloseCards();
                 g_cfgNameFocus = false;
+                g_cfgDelArm = false;              // the question only lives on its tab
                 if (hitTab != g_sec) {
-                    static const char* secName[kSecCount] = { "wallhack", "aim", "grenades", "misc", "configs", "trigger" };
+                    static const char* secName[kSecCount] = { "wallhack", "aim", "grenades", "misc", "configs", "trigger", "rcs" };
                     g_sec = hitTab;
                     g_menuScroll = g_menuScrollT = 0;      // each section starts at the top
                     if (hitTab == kSecCfg) CfgRefresh();   // entering configs: rescan the folder
@@ -7994,6 +8212,23 @@ static void HandleMenuInput() {
                 CloseCards();
                 g_hitDropOpen = !was;
                 Logf("[trig] hit groups dropdown %s\n", g_hitDropOpen ? "open" : "closed");
+            } else if (hitCfgDel) {
+                // trash: arm the confirmation for the picked config (this
+                // wins over the open picker list, which it takes down here)
+                if (g_cfgSel >= 0 &&
+                    g_cfgSel < static_cast<int>(g_cfgFiles.size())) {
+                    strncpy_s(g_cfgDelName, sizeof(g_cfgDelName),
+                              g_cfgFiles[g_cfgSel].c_str(), _TRUNCATE);
+                    g_cfgDelArm = true;
+                    g_cfgDelArmAt = GetTickCount();
+                    Logf("[cfg] delete asked for %s\n", g_cfgDelName);
+                } else {
+                    CfgNote("no config picked to delete");
+                }
+                g_cfgDropOpen = false;
+                g_bhopDropOpen = false;
+                g_guiDropOpen = false;
+                g_rgbEdit = -1;
             } else if (g_cfgDropOpen && (hitCfgItem >= 0 || !hitCfg)) {
                 // the open list takes the click: an item picks the file,
                 // anything else just closes it
@@ -8036,6 +8271,15 @@ static void HandleMenuInput() {
                 CfgNote("folder opened");
                 g_bhopDropOpen = false;
                 g_guiDropOpen = false;
+                g_cfgDropOpen = false;
+                g_rgbEdit = -1;
+            } else if (hitCfgDelYes) {
+                CfgDelete();
+                g_cfgDropOpen = false;
+                g_rgbEdit = -1;
+            } else if (hitCfgDelNo) {
+                g_cfgDelArm = false;
+                CfgNote("delete cancelled");
                 g_cfgDropOpen = false;
                 g_rgbEdit = -1;
             } else if (hitAimCfgBtn) {
@@ -8227,6 +8471,11 @@ static void HandleMenuInput() {
                 g_aimOn = !g_aimOn;
                 printf("[*] aimbot %s\n", g_aimOn ? "ON" : "OFF");
                 Logf("[aim] aimbot %s\n", g_aimOn ? "ON" : "OFF");
+            } else if (hitRcs) {
+                g_rcsOn = !g_rcsOn;
+                printf("[*] recoil control %s\n", g_rcsOn ? "ON" : "OFF");
+                Logf("[rcs] recoil control %s (smoothness %d)\n",
+                     g_rcsOn ? "ON" : "OFF", g_rcsSmooth);
             } else if (hitTrig) {
                 if (g_safeMode && !g_triggerOn) {
                     SafeNotify("triggerbot blocked: safe mode is ON");
@@ -8475,6 +8724,16 @@ static void HandleMenuInput() {
                     g_hitLogLife = ns;
                     Logf("[hit] log time %d s\n", g_hitLogLife);
                 }
+            } else if (s_dragRow == kRcsSmoothRow) {
+                int ns = kRcsSmoothMin +
+                         static_cast<int>(t * (kRcsSmoothMax - kRcsSmoothMin) + 0.5f);
+                if (ns < kRcsSmoothMin) ns = kRcsSmoothMin;
+                if (ns > kRcsSmoothMax) ns = kRcsSmoothMax;
+                if (g_safeMode) ns = 5;      // safe mode pins RCS smoothness at 5
+                if (ns != g_rcsSmooth) {
+                    g_rcsSmooth = ns;
+                    Logf("[rcs] smoothness %d\n", g_rcsSmooth);
+                }
             }
         }
 
@@ -8626,6 +8885,7 @@ static int   g_sentDy = 0;
 static DWORD g_sentMs = 0;
 static Vec3  g_sentWorld{};
 static bool  g_sent   = false;
+static DWORD s_rcsSendMs = 0;    // last RCS send — the resp sampler waits it out
 // target lock + reaction state
 static int   s_lockSlot  = 0;      // controller slot currently locked (0 = none)
 static DWORD s_lockMs    = 0;      // when the current lock was acquired
@@ -8903,7 +9163,10 @@ static void AimTick() {
     // toward too-large px-per-mickey (under-correction: the aim crept toward
     // the head and read as slow reaction) or too-small (overshoot and miss).
     // The sample is consumed here, so every send contributes at most once.
-    if (g_sent && GetTickCount() - g_sentMs < 150 && !scoped) {
+    // A recent RCS send in the same window would ride along in the numerator
+    // and skew the estimate, so the sampler waits its 150 ms out first.
+    if (g_sent && GetTickCount() - g_sentMs < 150 && !scoped &&
+        GetTickCount() - s_rcsSendMs >= 150) {
         Vec3 pre{}, post{};
         if (WorldToScreen(g_sentWorld, pre,  s_sendVm) &&
             WorldToScreen(g_sentWorld, post, g_vmCur)) {
@@ -8961,6 +9224,132 @@ static void AimTick() {
     g_sentWorld = { aimW.x, aimW.y, aimW.z };
     g_sent      = true;
     memcpy(s_sendVm, g_vmCur, sizeof(s_sendVm));  // wait for this to be folded in
+}
+
+// ---------------------------------------------------------------------------
+// recoil control (RCS)
+// ---------------------------------------------------------------------------
+// Counteracts the view kick while spraying, for every weapon. CS2 dropped
+// m_aimPunchAngle: the kick now lives behind m_pAimPunchServices -> a cache
+// at m_unpredictableBaseTick - 0x18 (count at +0, data pointer at +8, newest
+// 12-byte Vec3 entry last). The crosshair sits at view + punch*2, so holding
+// it still means turning the view by -2x every punch change; the angle is
+// converted to mickeys through the aimbot's own px-per-mickey estimate, so
+// any sensitivity comes out right without reading the sens setting at all.
+// Smoothness is lag, not loss: the compensation owed accumulates and each
+// frame sends only 1/smooth of it, so every setting applies the full
+// correction eventually — just later.
+static Vec3  s_rcsOldPunch{};
+static bool  s_rcsHavePunch = false;
+static float s_rcsOwedX = 0.0f, s_rcsOwedY = 0.0f;   // mickeys still owed
+static float s_rcsVm[16] = {};    // view matrix as of the last RCS send
+static DWORD s_rcsPaceMs = 0;
+static DWORD s_rcsLogMs  = 0;
+
+static void RcsTick() {
+    auto reset = [&]() {
+        s_rcsHavePunch = false;
+        s_rcsOwedX = s_rcsOwedY = 0.0f;
+    };
+    if (!g_rcsOn || g_menuOpen || g_width <= 0 ||
+        GetForegroundWindow() != g_cs2Wnd) {
+        reset();
+        return;
+    }
+    const uintptr_t lp = Read<uintptr_t>(g_client + off::dwLocalPlayerPawn);
+    if (!lp) { reset(); return; }
+
+    // fire + scope gates: compensation only while actually spraying (the
+    // first bullet sets the baseline, it does not chase its own kick), never
+    // while scoped, and only with the button down — LMB sees injected clicks
+    const int  shots  = Read<int>(lp + net::C_CSPlayerPawn::m_iShotsFired);
+    const bool scoped = Read<bool>(lp + net::C_CSPlayerPawn::m_bIsScoped);
+    const bool lmb    = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+
+    // newest punch entry from the services cache
+    constexpr std::ptrdiff_t kPunchCache = 0x88;   // m_unpredictableBaseTick - 0x18
+    Vec3 punch{};
+    bool ok = false;
+    const uintptr_t svc = Read<uintptr_t>(
+        lp + net::C_CSPlayerPawn::m_pAimPunchServices);
+    if (svc) {
+        const int       count = Read<int>(svc + kPunchCache);
+        const uintptr_t data  = Read<uintptr_t>(svc + kPunchCache + 8);
+        if (count > 0 && count <= 0xFFFF && data) {
+            punch = Read<Vec3>(data + static_cast<uintptr_t>(count - 1) * 12);
+            ok = fabsf(punch.x) < 60.0f && fabsf(punch.y) < 60.0f;  // NaN fails <
+        }
+    }
+    if (!ok) { reset(); return; }
+
+    // The baseline always tracks the punch — even while idle, when it decays
+    // back to zero — so entering the firing window starts from the kick as it
+    // stands and crossing a gate can never fire one stale correction
+    if (!s_rcsHavePunch) {
+        s_rcsOldPunch  = punch;
+        s_rcsHavePunch = true;
+        s_rcsOwedX = s_rcsOwedY = 0.0f;
+        return;
+    }
+    const float dPitch = punch.x - s_rcsOldPunch.x;
+    const float dYaw   = punch.y - s_rcsOldPunch.y;
+    s_rcsOldPunch = punch;
+    if (shots <= 1 || scoped || !lmb) { s_rcsOwedX = s_rcsOwedY = 0.0f; return; }
+    if (fabsf(dPitch) > 20.0f || fabsf(dYaw) > 20.0f) return;   // implausible read
+
+    // full compensation for this punch change: the view turns -2x the delta
+    // (pitch + is down and mouse +dy is down; the yaw sign works out the same
+    // as the proven readers) — angle to screen px over the focal length, px
+    // to mickeys over the live px-per-mickey: the same conversion the aimbot
+    // steering uses, so both senders speak one unit
+    auto ProjScale = [](const float* m, int row) {
+        return sqrtf(m[row] * m[row] + m[row + 1] * m[row + 1] + m[row + 2] * m[row + 2]);
+    };
+    const float respX  = g_respX > 0.01f ? g_respX : 0.5f;
+    const float respY  = g_respY > 0.01f ? g_respY : 0.5f;
+    const float kDegRad = 3.14159265f / 180.0f;
+    const float pitchDeg = -2.0f * dPitch;
+    const float yawDeg   =  2.0f * dYaw;
+    s_rcsOwedX += g_width  * 0.5f * ProjScale(g_vmCur, 0) *
+                  tanf(yawDeg * kDegRad) / respX;
+    s_rcsOwedY += g_height * 0.5f * ProjScale(g_vmCur, 4) *
+                  tanf(pitchDeg * kDegRad) / respY;
+    if (fabsf(s_rcsOwedX) < 0.05f && fabsf(s_rcsOwedY) < 0.05f) return;  // settled
+
+    // one send per consumed view update, like the aimbot: the game folds
+    // queued motion in once per frame, so queueing into an un-applied frame
+    // would pile up and whip the view past level when it lands
+    if (memcmp(s_rcsVm, g_vmCur, sizeof(s_rcsVm)) == 0 &&
+        GetTickCount() - s_rcsPaceMs < 16) return;
+    s_rcsPaceMs = GetTickCount();
+
+    const float sm = static_cast<float>(g_rcsSmooth);   // 1..10, safe mode pins 5
+    const float dxf = s_rcsOwedX / sm;
+    const float dyf = s_rcsOwedY / sm;
+    int mx = static_cast<int>(dxf >= 0.0f ? dxf + 0.5f : dxf - 0.5f);
+    int my = static_cast<int>(dyf >= 0.0f ? dyf + 0.5f : dyf - 0.5f);
+    if (mx >  400) mx =  400;
+    if (mx < -400) mx = -400;
+    if (my >  400) my =  400;
+    if (my < -400) my = -400;
+    if (mx == 0 && my == 0) return;
+
+    INPUT in{};
+    in.type       = INPUT_MOUSE;
+    in.mi.dx      = mx;
+    in.mi.dy      = my;
+    in.mi.dwFlags = MOUSEEVENTF_MOVE;
+    if (SendInput(1, &in, sizeof(in)) != 1) return;   // not delivered: keep the debt
+
+    s_rcsOwedX -= static_cast<float>(mx);   // only what the mouse actually got
+    s_rcsOwedY -= static_cast<float>(my);
+    s_rcsSendMs = GetTickCount();
+    memcpy(s_rcsVm, g_vmCur, sizeof(s_rcsVm));
+    if (s_rcsSendMs - s_rcsLogMs > 1000) {
+        s_rcsLogMs = s_rcsSendMs;
+        Logf("[rcs] kick=(%+.2f,%+.2f) send=(%d,%d) owed=(%.1f,%.1f) sm=%d\n",
+             dPitch, dYaw, mx, my, s_rcsOwedX, s_rcsOwedY, g_rcsSmooth);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9373,6 +9762,20 @@ static const char* ThresholdBox(int dmg) {
     return "body";
 }
 
+// fatal-hit fallback: the logged number is remaining HP, not true damage
+// (overkill is lost to the cap), so the ratio test cannot apply as-is — a
+// one-tap headshot, or any headshot onto a low-HP victim, would always read
+// "body". Instead: nothing below the stomach line (1.25x base, the hardest
+// non-head hit) can reach above it, so a kill from above that line must be
+// a headshot; at or below it the placement is unknowable from the number
+// alone and the ratio test gets what's left.
+static const char* KillBox(int prevHp) {
+    for (const TrigWeapDmg& w : kTrigWeapDmg)
+        if (w.def == g_wepDef)
+            return prevHp > w.dmg * 1.25f ? "head" : ThresholdBox(prevHp);
+    return "body";
+}
+
 static void HitLogShow(const char* name, const char* box, int dmg, bool kill, DWORD now) {
     // at capacity the oldest alive row retires at once; survivors glide up
     if (g_hitLogs.size() >= 3)
@@ -9459,7 +9862,7 @@ static void HitLogTick() {
         const char* box = nullptr;
         if (onCross && g_triggerOn && g_trigCond) box = (g_trigRegion == 2) ? "head" : "body";
         else if (locked && (g_aimOn || g_awOn)) box = kAimRgName[g_aimRegion];
-        else if (onCross) box = ThresholdBox(prev);
+        else if (onCross) box = KillBox(prev);
         else box = kAimRgName[g_aimRegion];
         if (!box) box = "body";
         char nm[64] = "";
@@ -9762,8 +10165,10 @@ static void DrawSniperXhair(HDC dc) {
 // zooms with the scope instead of drifting off the true cone.
 static void DrawFovCircle(HDC dc) {
     // only while the aimbot itself is on — turning the aimbot off hides the
-    // circle even if the FOV Circle toggle stays enabled for next time
-    if (!g_fovCircleOn || !g_aimOn || g_width <= 0 || g_height <= 0) return;
+    // circle even if the FOV Circle toggle stays enabled for next time.
+    // It also stays hidden outside a live match (menu/lobby): the matrix
+    // down those paths is stale or identity, so the ring would be fiction.
+    if (!g_fovCircleOn || !g_aimOn || !g_inMatch || g_width <= 0 || g_height <= 0) return;
     const float* m = g_vmCur;
     const float p00 = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
     if (p00 <= 0.0f) return;
@@ -11198,6 +11603,7 @@ int main() {
         TracerTick();
         AimTick();
         TriggerTick();
+        RcsTick();
         HitLogTick();
         FullscreenTick();
         AutoScopeTick();

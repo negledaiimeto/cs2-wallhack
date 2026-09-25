@@ -27,8 +27,9 @@ whether it's waiting for `cs2.exe`.
 ## Menu
 
 Toggles: Wallhack, Aimbot, Triggerbot, Autowall, Revolver Trigger, Sniper
-Crosshair, Radar, FOV Circle, Auto Bhop, Enemy Weapons (Tab) — plus the
-sliders (Smoothness, Reaction, Trig Reaction, Trig Hitchance, Aimbot FOV).
+Crosshair, Radar, FOV Circle, Auto Bhop, Enemy Weapons (Tab), Recoil Control —
+plus the sliders (Smoothness, Reaction, Trig Reaction, Trig Hitchance, Aimbot
+FOV, RCS Smoothness).
 Drag the header to move the panel.
 
 A toggle whose feature can't act while another toggle is off draws dim —
@@ -53,12 +54,36 @@ grenades in that order; knives are left out, every slot has one). It
 refreshes live while the key is down and disappears the moment you release
 it.
 
-**Autowall** (AimHack tab): hover either autowall row for its one-line
+**Autowall** (Trigger tab): hover either autowall row for its one-line
 description in the footer. Autowall picks whatever the crosshair rests on —
 wall or not — and aims at that target and triggers only while the estimated
 shot damage clears the **Autowall Dmg** slider (101 = Kill). With the
 aimbot/triggerbot off it acts alone; with them on it only handles the
 targets their own ray cannot see.
+
+### Recoil Control (RCS)
+
+The seventh tab, one global setting for every weapon:
+
+- **Recoil Control** toggle — while it is on, spraying (left button down,
+  past the first shot, not scoped) reads the live aim punch from the local
+  pawn's aim-punch services and injects the mouse movement that cancels twice
+  every punch change, so the crosshair stays where you put it through a
+  spray. The angle is converted with the aimbot's own px-per-mickey
+  estimate, so it tracks any in-game sensitivity without reading the sens
+  setting. Nothing runs while the menu is open, while scoped, or with the
+  button up — the punch baseline keeps following the real value in the
+  background, so turning a gate off can never fire a stale correction.
+- **Smoothness** bar (1–10) — how much of the owed correction is released
+  each frame: 1 = instant, 10 = slowest. It is lag, not loss: the rest of
+  the correction stays owed and is applied on the following frames. **Safe
+  mode pins it at 5** (forced on when safe mode is enabled, and the bar
+  cannot be dragged away from 5 while safe mode is on).
+- **Held Weapon** row — the weapon the local player currently holds, read
+  through the same detection the aimbot uses (the weapon chain now also
+  updates when only RCS is on).
+- Saved with the config as `rcs=` and `rcssm=`; a 1 Hz `[rcs]` line lands
+  in the log while it is actively compensating.
 
 ### Weapon classes (AimHack)
 
