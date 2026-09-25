@@ -45,7 +45,7 @@ own revolver shot either way.
 Every GUI fades: the menu, each side card (aim, wallhack, box, C4, tracer,
 sniper, thickness preview, colour picker) and the spectator list dissolve
 in when they appear and out when they close (~150 ms crossfade over the
-game, not a pop); the hit-log history text eases the same way.
+game, not a pop); the hit-feed rows carry their own fade.
 
 **Enemy Weapons (Tab)** (Wallhack tab): with the toggle on, hold TAB and a
 card appears on the right of the screen, beside the scoreboard — one row per
@@ -153,17 +153,15 @@ to include them.
 
 Hits you actually dealt (hp-drop attribution — only while the victim is
 under your crosshair or aim-locked with a recent shot, so team/nade/fall
-damage never counts) show up in two places:
+damage never counts) show up as one top-right feed:
 
 - **Feed** — the animated lines under the radar: `Hit pv in the head for
   42 damage.` Newest at the bottom, fades after **Log Time** (Misc slider,
-  1–10 s, saved as `hitlog=`).
-- **History** (the same popping text, kept) — with **Hit Log** on (Misc
-  button, saved as `hitgui=`) the last 50 hits are listed directly under
-  the live feed rows as plain text: `12:03 pv head 42` with the time in
-  gray, damage in green and kills tagged `(kill)` in red, newest first.
-  No card — it is the same feed column, and it only appears once there is
-  something to show.
+  1–10 s, saved as `hitlog=`). The **Hit Log** button (Misc, saved as
+  `hitgui=`) shows and hides the feed as a whole — on by default.
+
+The old timestamped history list that used to sit under the feed rows is
+gone: the toggle belongs to the live logs themselves now.
 
 ### Grenades
 

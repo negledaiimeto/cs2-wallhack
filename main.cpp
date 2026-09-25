@@ -260,8 +260,8 @@ static const int           kColRow[kColCount] = { 14, 15, 7, 9, 14, 39, 39, 39, 
 // at every launch, so the startup banner always announces what changed
 // (rewritten with every update before the build/restart)
 static const char* const kUpdateNote =
-    "autowall moved from the AimHack tab into the Trigger section - its toggle "
-    "and Autowall Dmg gate now sit with the revolver and trigger gates";
+    "Hit Log button now shows and hides the top-right hit feed itself; the old "
+    "timestamped history list under it is removed";
 static int                 g_rgbEdit = -1;      // open picker (kCol* index), -1 = closed
 static int                 s_rgbCol = 0;        // last open swatch: keeps the picker's layout valid while it fades out
 static bool                g_aimOn    = false;  // aimbot starts OFF; enabled from the in-game menu
@@ -318,7 +318,7 @@ static bool g_trcE = false, g_trcL = false, g_trcM = false;  // tracer switches:
 static bool g_trcOpen = false;  // tracer settings card (arrow on its Wallhack row)
 static int   g_trcLifeMs = 350; // how long a tracer stays visible, ms (duration slider)
 static float g_trcThkE = 2.0f, g_trcThkL = 2.0f, g_trcThkM = 2.0f;  // line width per side, design px
-static bool  g_hitLogGuiOn = false;  // hit-log history text under the popping feed (Misc)
+static bool  g_hitLogGuiOn = true;   // the popping hit feed top-right (Misc, hitgui=)
 static bool  g_safeMode    = false; // safe mode (header pill): blocks trigger/rev/
                                     // autowall/bhop from turning on, holds fire, floors
                                     // aim smoothness at 10, caps FOV at 5 deg and
@@ -3880,7 +3880,7 @@ static constexpr int kAwDmgRow     = 38;  // autowall min-damage slider
 static constexpr int kHitLogRow    = 40;  // hit-feed lifetime slider (Misc)
 static constexpr int kHitLogMin = 1, kHitLogMax = 10, kHitLogDft = 4;  // seconds
 static int   g_hitLogLife = kHitLogDft;
-static constexpr int kHitLogGuiRow = 41;  // hit-log history toggle (Misc)
+static constexpr int kHitLogGuiRow = 41;  // hit feed on/off toggle (Misc)
 static constexpr int kTrcRow       = 39;  // bullet tracers button (opens its card)
 static constexpr int kTrigAirRow    = 50;  // air check toggle
 static constexpr int kTrigScopeRow  = 51;  // auto scope mirror toggle
@@ -5009,7 +5009,6 @@ static void IconRcs(HDC dc, int cx, int cy, COLORREF fg) {
 // ---------------------------------------------------------------------------
 static float g_uiDt = 1.0f / 60.0f;   // dt of the frame being painted, set at PaintOverlay's top
 static float s_menuFade = 0.0f;       // menu panel
-static float s_hitFade  = 0.0f;       // hit-log history text
 static float s_specFade = 0.0f;       // spectator list
 // side cards / popups inside the menu — one fade each, so a card that was
 // never open doesn't ride another card's close
@@ -9741,19 +9740,6 @@ static DWORD       s_lastLmbMs = 0;
 // but a stamp from within the firing window still attributes the frag
 static DWORD       s_crossMs[65] = {};
 
-// persistent history behind the Misc hit-log toggle: the feed above fades
-// after its few seconds, this keeps the last 50 events with their wall-clock
-// stamps and kill flags so the history text has something to show between fights
-static constexpr int kHitHistMax = 50;
-struct HitHistEntry {
-    WORD  h, m;          // hour:minute of the event (local time)
-    char  name[64];
-    char  box[16];
-    int   dmg;
-    bool  kill;
-};
-static std::vector<HitHistEntry> g_hitHist;
-
 // manual-aim fallback: head vs body from our current weapon (see note above)
 static const char* ThresholdBox(int dmg) {
     for (const TrigWeapDmg& w : kTrigWeapDmg)
@@ -9790,18 +9776,6 @@ static void HitLogShow(const char* name, const char* box, int dmg, bool kill, DW
     e.y = static_cast<float>(g_height);   // slides up into place
     g_hitLogs.push_back(e);
     while (g_hitLogs.size() > 6) g_hitLogs.erase(g_hitLogs.begin());
-    // same event into the persistent history, stamped with the wall clock
-    SYSTEMTIME stNow;
-    GetLocalTime(&stNow);
-    HitHistEntry he{};
-    he.h = stNow.wHour;
-    he.m = stNow.wMinute;
-    strncpy_s(he.name, sizeof(he.name), name, _TRUNCATE);
-    strncpy_s(he.box, sizeof(he.box), box, _TRUNCATE);
-    he.dmg = dmg;
-    he.kill = kill;
-    g_hitHist.push_back(he);
-    while (g_hitHist.size() > kHitHistMax) g_hitHist.erase(g_hitHist.begin());
 }
 
 static void HitLogTick() {
@@ -9882,13 +9856,14 @@ static void HitLogTick() {
     }
 }
 
-// hit feed on the right, below the game's killfeed: newest at the bottom,
-// overflow retires the oldest while survivors glide up. GDI+ carries the
-// alpha — GDI text cannot fade.
+// hit feed top-right under the radar: newest at the bottom, overflow
+// retires the oldest while survivors glide up. GDI+ carries the alpha —
+// GDI text cannot fade. The Misc Hit Log toggle (hitgui=) shows and hides
+// the feed itself; the timestamped history list that used to sit under
+// these rows is gone — the button belongs to the live logs only.
 static void DrawHitLogs(HDC dc) {
     if (g_width <= 0 || g_height <= 0) return;
-    const bool histOn = g_hitLogGuiOn && !g_hitHist.empty();
-    if (g_hitLogs.empty() && !histOn) return;
+    if (!g_hitLogGuiOn || g_hitLogs.empty()) return;
     const int fx = g_width - U(12) - U(300);
     const int fy = U(260);
     const int rowH = U(26), gap = U(6);
@@ -9905,74 +9880,6 @@ static void DrawHitLogs(HDC dc) {
     Gdiplus::StringFormat sf;
     sf.SetAlignment(Gdiplus::StringAlignmentNear);
     sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-
-    // history rides the same column as the popping rows — plain feed text, no
-    // standing card (Misc toggle, hitgui=). It sits directly under the live
-    // rows and eases down as they pile up, so it reads as part of the text
-    // that pops on a hit: gray time, green damage, red kills.
-    s_hitFade = GuiEase(s_hitFade, g_hitLogGuiOn, g_uiDt);
-    const int rowFull = rowH + gap;
-    static float s_histY = -1.0f;
-    const float histTarget =
-        static_cast<float>(fy + static_cast<int>(g_hitLogs.size()) * rowFull);
-    if (s_histY < 0.0f) s_histY = histTarget;
-    if (dt > 0.0f) {
-        float hk = dt * 10.0f;
-        if (hk > 1.0f) hk = 1.0f;
-        s_histY += (histTarget - s_histY) * hk;
-        if (fabsf(histTarget - s_histY) <= 0.5f) s_histY = histTarget;
-    }
-    const int hn = static_cast<int>(g_hitHist.size());
-    if (histOn && s_hitFade > 0.01f) {
-        const int hRow = U(18);
-        const int hTop = static_cast<int>(s_histY);
-        int fit = (g_height - hTop - U(12)) / hRow;
-        if (fit < 0) fit = 0;
-        int show = hn < 10 ? hn : 10;
-        if (show > fit) show = fit;
-        const BYTE ha = static_cast<BYTE>(s_hitFade * 255.0f);
-        Gdiplus::Font fHist(&ff, 13.0f, Gdiplus::FontStyleBold,
-                            Gdiplus::UnitPixel);
-        Gdiplus::SolidBrush brTime(Gdiplus::Color(ha, 130, 135, 145));
-        Gdiplus::SolidBrush brTxt(Gdiplus::Color(ha, 235, 235, 235));
-        Gdiplus::SolidBrush brDmg(Gdiplus::Color(ha, 110, 255, 110));
-        Gdiplus::SolidBrush brKill(Gdiplus::Color(ha, 255, 105, 97));
-        for (int i = 0; i < show; ++i) {
-            const HitHistEntry& e = g_hitHist[hn - 1 - i];   // newest first
-            const float hy = static_cast<float>(hTop + i * hRow);
-            wchar_t tm[16], pre[96], num[16], tail[16];
-            swprintf_s(tm, L"%02u:%02u ", static_cast<unsigned>(e.h),
-                       static_cast<unsigned>(e.m));
-            swprintf_s(pre, L"%hs %hs ", e.name, e.box);
-            swprintf_s(num, L"%d", e.dmg);
-            swprintf_s(tail, e.kill ? L"(kill)" : L"");
-            Gdiplus::RectF mb;
-            float x = static_cast<float>(fx);
-            gfx.MeasureString(tm, -1, &fHist, Gdiplus::PointF(x, hy), &mb);
-            gfx.DrawString(tm, -1, &fHist,
-                           Gdiplus::RectF(x, hy, mb.Width + 1.0f,
-                                          static_cast<float>(hRow)),
-                           &sf, &brTime);
-            x += mb.Width;
-            gfx.MeasureString(pre, -1, &fHist, Gdiplus::PointF(x, hy), &mb);
-            gfx.DrawString(pre, -1, &fHist,
-                           Gdiplus::RectF(x, hy, mb.Width + 1.0f,
-                                          static_cast<float>(hRow)),
-                           &sf, &brTxt);
-            x += mb.Width;
-            gfx.MeasureString(num, -1, &fHist, Gdiplus::PointF(x, hy), &mb);
-            gfx.DrawString(num, -1, &fHist,
-                           Gdiplus::RectF(x, hy, mb.Width + 1.0f,
-                                          static_cast<float>(hRow)),
-                           &sf, &brDmg);
-            x += mb.Width;
-            if (e.kill)
-                gfx.DrawString(tail, -1, &fHist,
-                               Gdiplus::RectF(x, hy, 80.0f,
-                                              static_cast<float>(hRow)),
-                               &sf, &brKill);
-        }
-    }
 
     int idx = 0;
     for (auto& e : g_hitLogs) {
